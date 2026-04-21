@@ -21,6 +21,9 @@ import site
 import socket
 import subprocess
 import sys
+import time
+import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -42,6 +45,9 @@ if sys.version_info < (3, 10):
     sys.exit(1)
 
 github_actions = bool(os.getenv("GITHUB_ACTIONS"))
+_python_deps_checked = False
+DEPS_STATE_FILE_NAME = "penv_python_deps_state.json"
+DEPS_LOCK_FILE_NAME  = "penv_python_deps.lock"
 
 PLATFORMIO_URL_VERSION_RE = re.compile(
     r'/v?(\d+\.\d+\.\d+(?:[.-](?:alpha|beta|rc|dev|post|pre)\d*)?(?:\.\d+)?)(?:\.(?:zip|tar\.gz|tar\.bz2))?$',
@@ -58,6 +64,7 @@ python_deps = {
     "zopfli": ">=0.2.2",
     "intelhex": ">=2.3.0",
     "rich": ">=14.0.0",
+    "urllib3": "<3",
     "cryptography": ">=45.0.3",
     "certifi": ">=2025.8.3",
     "ecdsa": ">=0.19.1",
@@ -68,6 +75,105 @@ python_deps = {
     "pyelftools": ">=0.32"
 }
 
+PACKAGE_NAME_ALIASES = {
+    # The pioarduino core URL installs distribution name `pioarduino-core`.
+    "platformio": ("platformio", "pioarduino-core"),
+}
+
+
+def _cache_paths(platformio_dir):
+    cache_dir = Path(platformio_dir) / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / DEPS_STATE_FILE_NAME, cache_dir / DEPS_LOCK_FILE_NAME
+
+
+def _get_penv_dir(penv_python):
+    return Path(penv_python).parent.parent
+
+
+def _compute_fingerprint(penv_python):
+    normalized_deps = json.dumps(python_deps, sort_keys=True, separators=(",", ":"))
+    penv_dir = _get_penv_dir(penv_python)
+    pyvenv_cfg = penv_dir / "pyvenv.cfg"
+    try:
+        pyvenv_cfg_stat = pyvenv_cfg.stat()
+        penv_marker = f"{pyvenv_cfg_stat.st_size}:{pyvenv_cfg_stat.st_mtime_ns}"
+    except OSError:
+        penv_marker = "missing"
+    payload = "|".join([
+        normalized_deps,
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        str(penv_dir.resolve()),
+        penv_marker,
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@contextmanager
+def _file_lock(lock_file: Path, timeout_sec: int = 60):
+    deadline = time.monotonic() + timeout_sec
+    fd = None
+    while True:
+        try:
+            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timeout waiting for lock: {lock_file}")
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            lock_file.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_fingerprint(state_file: Path) -> "str | None":
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        return data.get("fingerprint")
+    except Exception:
+        return None
+
+
+def _save_fingerprint(state_file: Path, fingerprint: str):
+    payload = {"fingerprint": fingerprint, "updated_at": int(time.time())}
+    tmp = state_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(tmp, state_file)
+
+
+def _cache_is_valid(state_file: Path, fingerprint: str, penv_python: str) -> bool:
+    if _read_fingerprint(state_file) != fingerprint:
+        return False
+
+    penv_uv = Path(_get_penv_dir(penv_python)) / (
+        "Scripts/uv.exe" if IS_WINDOWS else "bin/uv"
+    )
+    if not penv_uv.is_file():
+        print("[penv] Dependency cache invalidated: uv is missing from penv")
+        return False
+
+    missing_or_mismatched = _get_missing_or_mismatched_deps(penv_python, str(penv_uv))
+    if missing_or_mismatched:
+        summary = ", ".join(missing_or_mismatched[:4])
+        if len(missing_or_mismatched) > 4:
+            summary += ", ..."
+        print(
+            "[penv] Dependency cache invalidated: required Python dependencies are missing or mismatched "
+            f"({summary})"
+        )
+        return False
+
+    return True
+
 
 def has_internet_connection(timeout=5):
     """
@@ -75,7 +181,7 @@ def has_internet_connection(timeout=5):
     Can be overridden by setting PLATFORMIO_OFFLINE=1 environment variable.
     1) If HTTPS/HTTP proxy environment variable is set, test TCP connectivity to the proxy endpoint.
     2) Otherwise, test direct TCP connectivity to common HTTPS endpoints (port 443).
-    
+      
     Args:
         timeout (int): Timeout duration in seconds for the connection test.
 
@@ -85,8 +191,9 @@ def has_internet_connection(timeout=5):
     # Check if offline mode is forced via environment variable
     if os.getenv("PLATFORMIO_OFFLINE", "").strip().lower() in ("1", "true", "yes"):
         return False
-
+      
     # 1) Test TCP connectivity to the proxy endpoint.
+    probe_started_at = time.monotonic()
     proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
     if proxy:
         try:
@@ -95,6 +202,7 @@ def has_internet_connection(timeout=5):
             port = u.port or (443 if u.scheme == "https" else 80)
             if host and port:
                 socket.create_connection((host, port), timeout=timeout).close()
+                print(f"[penv] Internet reachable via proxy in {time.monotonic() - probe_started_at:.2f}s")
                 return True
         except Exception:
             # If proxy connection fails, fall back to direct connection test
@@ -105,16 +213,22 @@ def has_internet_connection(timeout=5):
     for host in https_hosts:
         try:
             socket.create_connection((host, 443), timeout=timeout).close()
+            print(f"[penv] Internet reachable via {host}:443 in {time.monotonic() - probe_started_at:.2f}s")
             return True
         except Exception:
             continue
+
+    print(f"[penv] No internet connection detected after {time.monotonic() - probe_started_at:.2f}s")
 
     # Direct DNS:53 connection is abolished due to many false positives on enterprise networks
     # (add it at the end if necessary)
     return False
 
 
-has_network = has_internet_connection() or github_actions
+connectivity_started_at = time.monotonic()
+online = has_internet_connection()
+print(f"[penv] Internet connectivity phase took {time.monotonic() - connectivity_started_at:.2f}s")
+has_network = online or github_actions
 
 
 def get_executable_path(penv_dir, executable_name):
@@ -297,38 +411,16 @@ def setup_pipenv_in_package(env, penv_dir):
 
 
 def setup_python_paths(penv_dir):
-    """Setup Python module search paths using the penv_dir.
-
-    Dynamically locates the penv's site-packages directory instead of
-    deriving it from ``sys.version_info``, which reflects the *host*
-    interpreter and may differ from the Python version used to create
-    the penv.  The penv's site-packages is inserted at the front of
-    ``sys.path`` and conflicting system site-packages entries are
-    removed so that packages installed in the penv always take
-    precedence.
-    """
-    site_packages = _get_penv_site_packages(penv_dir)
-    if not site_packages:
-        return
-
-    penv_dir_resolved = os.path.realpath(penv_dir) + os.sep
-
-    # Remove system site-packages entries that are not part of the penv
-    sys.path[:] = [
-        p for p in sys.path
-        if "site-packages" not in p.lower()
-        or os.path.realpath(p).startswith(penv_dir_resolved)
-    ]
-
-    # Add penv site-packages at the beginning
-    if site_packages not in sys.path:
-        sys.path.insert(0, site_packages)
-
-    site.addsitedir(site_packages)
-    # Re-ensure penv is still first after addsitedir may have appended it
-    if sys.path[0] != site_packages:
-        sys.path.remove(site_packages)
-        sys.path.insert(0, site_packages)
+    """Setup Python module search paths using the penv_dir."""      
+    # Add site-packages directory
+    python_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site_packages = (
+        str(Path(penv_dir) / "Lib" / "site-packages") if IS_WINDOWS
+        else str(Path(penv_dir) / "lib" / python_ver / "site-packages")
+    )
+    
+    if os.path.isdir(site_packages):
+        site.addsitedir(site_packages)
 
 
 def get_packages_to_install(deps, installed_packages):
@@ -345,7 +437,8 @@ def get_packages_to_install(deps, installed_packages):
     """
     for package, spec in deps.items():
         name = package.lower()
-        if name not in installed_packages:
+        installed_version = _get_installed_package_version(installed_packages, package)
+        if installed_version is None:
             yield package
         elif name == "platformio":
             # Enforce the version from the direct URL if it looks like one.
@@ -353,15 +446,49 @@ def get_packages_to_install(deps, installed_packages):
             m = PLATFORMIO_URL_VERSION_RE.search(spec)
             if m:
                 expected_ver = pepver_to_semver(m.group(1))
-                if installed_packages.get(name) != expected_ver:
+                if installed_version != expected_ver:
                     # Reinstall to align with the pinned URL version
                     yield package
             else:
                 continue
         else:
             version_spec = semantic_version.SimpleSpec(spec)
-            if not version_spec.match(installed_packages[name]):
+            if not version_spec.match(installed_version):
                 yield package
+
+
+def _get_installed_package_version(installed_packages, package_name):
+    canonical_name = package_name.lower()
+    aliases = PACKAGE_NAME_ALIASES.get(canonical_name, (canonical_name,))
+    for alias in aliases:
+        if alias in installed_packages:
+            return installed_packages[alias]
+    return None
+
+
+def _get_missing_or_mismatched_deps(penv_python, uv_executable):
+    installed_packages = {}
+    try:
+        result_obj = subprocess.run(
+            [uv_executable, "pip", "list", f"--python={penv_python}", "--format=json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ["<dependency-index-unavailable>"]
+
+    if result_obj.returncode != 0:
+        return ["<dependency-index-unavailable>"]
+
+    try:
+        for package in json.loads(result_obj.stdout.strip() or "[]"):
+            installed_packages[package["name"].lower()] = pepver_to_semver(package["version"])
+    except (json.JSONDecodeError, KeyError):
+        return ["<dependency-index-unavailable>"]
+
+    return list(get_packages_to_install(python_deps, installed_packages))
 
 
 def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
@@ -376,6 +503,8 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
     Returns:
         bool: True if successful, False otherwise
     """
+    install_started_at = time.monotonic()
+    print("[penv] Checking Python dependencies...")
     # Get the penv directory to locate uv within it
     penv_dir = os.path.dirname(os.path.dirname(python_exe))
     penv_uv_executable = get_executable_path(penv_dir, "uv")
@@ -389,6 +518,7 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
     # Check if uv is available in the penv
     uv_in_penv_available = False
     try:
+        uv_check_started_at = time.monotonic()
         result = subprocess.run(
             [penv_uv_executable, "--version"],
             capture_output=True,
@@ -396,6 +526,7 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
             timeout=10
         )
         uv_in_penv_available = result.returncode == 0
+        print(f"[penv] uv availability check took {time.monotonic() - uv_check_started_at:.2f}s")
     except (FileNotFoundError, subprocess.TimeoutExpired):
         uv_in_penv_available = False
     
@@ -404,6 +535,7 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
         if external_uv_executable:
             # Try external uv first to install uv into the penv
             try:
+                uv_install_started_at = time.monotonic()
                 subprocess.check_call(
                     [external_uv_executable, "pip", "install", "uv>=0.1.0", f"--python={python_exe}", "--quiet"],
                     stdout=subprocess.DEVNULL,
@@ -412,26 +544,21 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
                     env=uv_env
                 )
                 uv_in_penv_available = True
+                print(f"[penv] Installed uv via external uv in {time.monotonic() - uv_install_started_at:.2f}s")
             except Exception:
                 print("Warning: uv installation via external uv failed, falling back to pip")
 
         if not uv_in_penv_available:
             # Fallback to pip to install uv into penv
-            # uv-created venvs don't include pip, so ensure it's available first
             try:
-                subprocess.run(
-                    [python_exe, "-m", "ensurepip", "--default-pip"],
-                    capture_output=True, timeout=60
-                )
-            except Exception:
-                pass
-            try:
+                pip_uv_started_at = time.monotonic()
                 subprocess.check_call(
                     [python_exe, "-m", "pip", "install", "uv>=0.1.0", "--quiet", "--no-cache-dir"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.STDOUT,
                     timeout=300
                 )
+                print(f"[penv] Installed uv via pip in {time.monotonic() - pip_uv_started_at:.2f}s")
             except subprocess.CalledProcessError as e:
                 print(f"Error: uv installation via pip failed with exit code {e.returncode}")
                 return False
@@ -456,6 +583,7 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
         result = {}
         try:
             cmd = [penv_uv_executable, "pip", "list", f"--python={python_exe}", "--format=json"]
+            list_started_at = time.monotonic()
             result_obj = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -464,6 +592,7 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
                 timeout=300,
                 env=uv_env
             )
+            print(f"[penv] uv pip list took {time.monotonic() - list_started_at:.2f}s")
             
             if result_obj.returncode == 0:
                 content = result_obj.stdout.strip()
@@ -489,6 +618,7 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
 
     installed_packages = _get_installed_uv_packages()
     packages_to_install = list(get_packages_to_install(python_deps, installed_packages))
+    print(f"[penv] python packages needing install: {len(packages_to_install)}")
     
     if packages_to_install:
         packages_list = []
@@ -506,6 +636,7 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
         ] + packages_list
         
         try:
+            deps_install_started_at = time.monotonic()
             subprocess.check_call(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -513,6 +644,7 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
                 timeout=300,
                 env=uv_env
             )
+            print(f"[penv] uv pip install finished in {time.monotonic() - deps_install_started_at:.2f}s")
                 
         except subprocess.CalledProcessError as e:
             print(f"Error: Failed to install Python dependencies (exit code: {e.returncode})")
@@ -527,6 +659,7 @@ def install_python_deps(python_exe, external_uv_executable, uv_cache_dir=None):
             print(f"Error installing Python dependencies: {e}")
             return False
     
+    print(f"[penv] Python dependency check/install total: {time.monotonic() - install_started_at:.2f}s")
     return True
 
 
@@ -537,7 +670,7 @@ def install_esptool(env, platform, python_exe, uv_executable, uv_cache_dir=None)
     
     Args:
         env: SCons environment object
-        platform: PlatformIO platform object  
+        platform: PlatformIO platform object    
         python_exe (str): Path to Python executable in virtual environment
         uv_executable (str): Path to uv executable
         uv_cache_dir: Optional path to uv cache directory
@@ -662,12 +795,39 @@ def _setup_python_environment_core(env, platform, platformio_dir, should_install
     uv_executable = get_executable_path(penv_dir, "uv")
 
     # Install required Python dependencies for ESP32 platform
-    if has_network:
-        if not install_python_deps(penv_python, used_uv_executable, uv_cache_dir):
-            sys.stderr.write("Error: Failed to install Python dependencies into penv\n")
-            sys.exit(1)
+    global _python_deps_checked
+    if _python_deps_checked:
+        print("[penv] Python dependency check already completed in this process, skipping")
     else:
-        print("Warning: No internet connection detected, Python dependency check will be skipped.")
+        state_file, lock_file = _cache_paths(platformio_dir)
+        fingerprint = _compute_fingerprint(penv_python)
+
+        try:
+            lock_wait_started_at = time.monotonic()
+            with _file_lock(lock_file):
+                print(f"[penv] Dependency lock acquired in {time.monotonic() - lock_wait_started_at:.2f}s")
+
+                if _cache_is_valid(state_file, fingerprint, penv_python):
+                    print("[penv] Cross-process dependency cache hit, skipping dependency check")
+                elif has_network:
+                    if not install_python_deps(penv_python, used_uv_executable, uv_cache_dir):
+                        sys.stderr.write("Error: Failed to install Python dependencies into penv\n")
+                        sys.exit(1)
+                    _save_fingerprint(state_file, fingerprint)
+                    print("[penv] Dependency cache state updated")
+                else:
+                    print("Warning: No internet connection detected, Python dependency check will be skipped.")
+
+        except TimeoutError as e:
+            if _cache_is_valid(state_file, fingerprint, penv_python):
+                print(f"[penv] {e}; dependency state already satisfied by another process")
+            else:
+                sys.stderr.write(
+                    f"Error: {e}. Refusing to install Python dependencies without synchronization.\n"
+                )
+                sys.exit(1)
+
+        _python_deps_checked = True
 
     # Install esptool package if required
     if should_install_esptool:
@@ -765,7 +925,7 @@ def _install_esptool_from_tl_install(platform, python_exe, uv_executable, uv_cac
     Install esptool from tl-install provided path into penv.
     
     Args:
-        platform: PlatformIO platform object  
+        platform: PlatformIO platform object    
         python_exe (str): Path to Python executable in virtual environment
         uv_executable (str): Path to uv executable
         uv_cache_dir: Optional path to uv cache directory
@@ -776,7 +936,7 @@ def _install_esptool_from_tl_install(platform, python_exe, uv_executable, uv_cac
     # Get esptool path from tool-esptoolpy package (provided by tl-install)
     esptool_repo_path = platform.get_package_dir("tool-esptoolpy") or ""
     if not esptool_repo_path or not os.path.isdir(esptool_repo_path):
-        return (None, None)
+        return
 
     # Build subprocess environment with UV_CACHE_DIR if specified
     uv_env = None
